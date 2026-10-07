@@ -98,10 +98,6 @@ async def query_gemini(user_message: str, api_key: str) -> str:
         "maxOutputTokens": 700
     }
 
-    # Eliminate latency: disable thinking reasoning delay on thinking/flash models
-    if any(k in model.lower() for k in ["2.", "3.", "flash", "thinking"]):
-        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
-
     payload = {
         "system_instruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
@@ -146,7 +142,8 @@ async def query_gemini(user_message: str, api_key: str) -> str:
 
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else "unknown"
-            logger.error(f"Gemini API HTTPStatusError: status_code={status_code}")
+            detail = exc.response.text if exc.response is not None else ""
+            logger.error(f"Gemini API HTTPStatusError: status_code={status_code}, detail={detail}")
             return f"The AI service returned an error (HTTP {status_code}). Please try again later."
 
         except httpx.RequestError as exc:
