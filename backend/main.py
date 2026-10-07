@@ -17,8 +17,8 @@ if not logger.handlers:
 # Suppress httpx request logging to prevent URL/header leaks
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Explicit timeout configuration (60s total/read, 10s connect)
-TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+# Explicit timeout configuration (30s total/read, 6s connect)
+TIMEOUT = httpx.Timeout(30.0, connect=6.0)
 
 # Load environment variables from .env
 load_dotenv()
@@ -98,8 +98,8 @@ async def query_gemini(user_message: str, api_key: str) -> str:
         "maxOutputTokens": 700
     }
 
-    # Reduce latency: if model is a gemini-2.5 model, set thinking budget to 0
-    if "2.5" in model:
+    # Eliminate latency: disable thinking reasoning delay on thinking/flash models
+    if any(k in model.lower() for k in ["2.", "3.", "flash", "thinking"]):
         generation_config["thinkingConfig"] = {"thinkingBudget": 0}
 
     payload = {
