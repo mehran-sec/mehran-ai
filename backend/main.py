@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from typing import Dict, List
@@ -8,6 +9,16 @@ import httpx
 from dotenv import load_dotenv
 
 from knowledge import SYSTEM_PROMPT
+
+# Configure logging
+logger = logging.getLogger("mehran_ai")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# Suppress httpx request logging to prevent URL/header leaks
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Explicit timeout configuration (60s total/read, 10s connect)
+TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 # Load environment variables from .env
 load_dotenv()
@@ -75,9 +86,22 @@ class ChatResponse(BaseModel):
 # LLM Providers Logic (Gemini & OpenAI)
 # ---------------------------------------------------------------------------
 async def query_gemini(user_message: str, api_key: str) -> str:
-    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json"
+    }
     
+    generation_config = {
+        "temperature": 0.2,
+        "maxOutputTokens": 700
+    }
+
+    # Reduce latency: if model is a gemini-2.5 model, set thinking budget to 0
+    if "2.5" in model:
+        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+
     payload = {
         "system_instruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
@@ -88,27 +112,52 @@ async def query_gemini(user_message: str, api_key: str) -> str:
                 "parts": [{"text": user_message}]
             }
         ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 700
-        }
+        "generationConfig": generation_config
     }
     
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(url, json=payload)
-        
-        if response.status_code != 200:
-            error_detail = response.text
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Gemini API returned an error ({response.status_code}): {error_detail}"
-            )
-            
-        data = response.json()
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
         try:
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except (KeyError, IndexError):
-            return "I apologize, but I could not parse the response from the AI model."
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                
+                data = response.json()
+                candidates = data.get("candidates")
+                if not candidates or not isinstance(candidates, list):
+                    logger.warning("Gemini response missing or empty 'candidates' field")
+                    return "I apologize, but I could not parse the response from the AI model."
+                
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if not parts or not isinstance(parts, list):
+                    logger.warning("Gemini candidate missing 'content.parts' field")
+                    return "I apologize, but I could not parse the response from the AI model."
+                
+                text = parts[0].get("text", "").strip()
+                if not text:
+                    return "I apologize, but I received an empty response from the AI model."
+                return text
+
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as exc:
+            logger.warning(f"Gemini API timeout on attempt {attempt}/{max_attempts}: {type(exc).__name__}")
+            if attempt < max_attempts:
+                continue
+            return "The AI service took too long to respond. Please try again."
+
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            logger.error(f"Gemini API HTTPStatusError: status_code={status_code}")
+            return f"The AI service returned an error (HTTP {status_code}). Please try again later."
+
+        except httpx.RequestError as exc:
+            logger.error(f"Gemini API request error: {type(exc).__name__}")
+            return "A network error occurred while contacting the AI service. Please try again."
+
+        except Exception as exc:
+            logger.error(f"Unexpected error in query_gemini: {type(exc).__name__}")
+            return "An unexpected error occurred while generating the response. Please try again."
+
+    return "The AI service took too long to respond. Please try again."
 
 async def query_openai(user_message: str, api_key: str) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -129,21 +178,44 @@ async def query_openai(user_message: str, api_key: str) -> str:
         ]
     }
     
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        
-        if response.status_code != 200:
-            error_detail = response.text
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"OpenAI API returned an error ({response.status_code}): {error_detail}"
-            )
-            
-        data = response.json()
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
         try:
-            return data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError):
-            return "I apologize, but I could not parse the response from the AI model."
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                
+                data = response.json()
+                choices = data.get("choices")
+                if not choices or not isinstance(choices, list):
+                    logger.warning("OpenAI response missing or empty 'choices' field")
+                    return "I apologize, but I could not parse the response from the AI model."
+                
+                text = choices[0].get("message", {}).get("content", "").strip()
+                if not text:
+                    return "I apologize, but I received an empty response from the AI model."
+                return text
+
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as exc:
+            logger.warning(f"OpenAI API timeout on attempt {attempt}/{max_attempts}: {type(exc).__name__}")
+            if attempt < max_attempts:
+                continue
+            return "The AI service took too long to respond. Please try again."
+
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            logger.error(f"OpenAI API HTTPStatusError: status_code={status_code}")
+            return f"The AI service returned an error (HTTP {status_code}). Please try again later."
+
+        except httpx.RequestError as exc:
+            logger.error(f"OpenAI API request error: {type(exc).__name__}")
+            return "A network error occurred while contacting the AI service. Please try again."
+
+        except Exception as exc:
+            logger.error(f"Unexpected error in query_openai: {type(exc).__name__}")
+            return "An unexpected error occurred while generating the response. Please try again."
+
+    return "The AI service took too long to respond. Please try again."
 
 # ---------------------------------------------------------------------------
 # API Endpoints
