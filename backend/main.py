@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -85,76 +86,86 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # LLM Providers Logic (Gemini & OpenAI)
 # ---------------------------------------------------------------------------
-async def query_gemini(user_message: str, api_key: str) -> str:
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    headers = {
-        "x-goog-api-key": api_key,
-        "Content-Type": "application/json"
-    }
-    
-    generation_config = {
-        "temperature": 0.2,
-        "maxOutputTokens": 700
-    }
+RETRYABLE = {429, 500, 502, 503, 504}
+
+async def query_gemini(user_message: str, api_keys: List[str]) -> str:
+    """Try each model with each API key. Retries transient errors (503 etc.)."""
+    models = [os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")]
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+    if fallback_model and fallback_model not in models:
+        models.append(fallback_model)
 
     payload = {
-        "system_instruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": user_message}]
-            }
-        ],
-        "generationConfig": generation_config
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 700},
     }
-    
-    max_attempts = 2
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-                response = await client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
-                
-                data = response.json()
-                candidates = data.get("candidates")
-                if not candidates or not isinstance(candidates, list):
-                    logger.warning("Gemini response missing or empty 'candidates' field")
-                    return "I apologize, but I could not parse the response from the AI model."
-                
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if not parts or not isinstance(parts, list):
-                    logger.warning("Gemini candidate missing 'content.parts' field")
-                    return "I apologize, but I could not parse the response from the AI model."
-                
-                text = parts[0].get("text", "").strip()
-                if not text:
-                    return "I apologize, but I received an empty response from the AI model."
-                return text
 
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as exc:
-            logger.warning(f"Gemini API timeout on attempt {attempt}/{max_attempts}: {type(exc).__name__}")
-            if attempt < max_attempts:
-                continue
-            return "The AI service took too long to respond. Please try again."
+    last_status = None
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        model_overloaded = False
+        for key_index, key in enumerate(api_keys, start=1):
+            if model_overloaded:
+                break  # 503s are per-model: more keys won't help, go to the fallback model
+            headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+            for attempt in range(1, 3):
+                try:
+                    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                        response = await client.post(url, headers=headers, json=payload)
 
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response is not None else "unknown"
-            detail = exc.response.text if exc.response is not None else ""
-            logger.error(f"Gemini API HTTPStatusError: status_code={status_code}, detail={detail}")
-            return f"The AI service returned an error (HTTP {status_code}). Please try again later."
+                    if response.status_code in RETRYABLE:
+                        last_status = response.status_code
+                        logger.warning(
+                            f"Gemini {model} key#{key_index} -> HTTP {response.status_code} "
+                            f"(attempt {attempt}/2) detail={response.text[:300]}"
+                        )
+                        if response.status_code == 429:
+                            break  # quota hit on this key: move on to the next key
+                        if attempt == 2:
+                            model_overloaded = True  # still failing after a retry
+                            break
+                        await asyncio.sleep(1.5 * attempt)
+                        continue
 
-        except httpx.RequestError as exc:
-            logger.error(f"Gemini API request error: {type(exc).__name__}")
-            return "A network error occurred while contacting the AI service. Please try again."
+                    response.raise_for_status()
+                    data = response.json()
+                    candidates = data.get("candidates")
+                    if not candidates or not isinstance(candidates, list):
+                        logger.warning("Gemini response missing or empty 'candidates' field")
+                        return "I apologize, but I could not parse the response from the AI model."
 
-        except Exception as exc:
-            logger.error(f"Unexpected error in query_gemini: {type(exc).__name__}")
-            return "An unexpected error occurred while generating the response. Please try again."
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if not parts or not isinstance(parts, list):
+                        logger.warning("Gemini candidate missing 'content.parts' field")
+                        return "I apologize, but I could not parse the response from the AI model."
 
-    return "The AI service took too long to respond. Please try again."
+                    text = parts[0].get("text", "").strip()
+                    if not text:
+                        return "I apologize, but I received an empty response from the AI model."
+                    return text
+
+                except httpx.TimeoutException as exc:
+                    last_status = "timeout"
+                    logger.warning(f"Gemini API timeout ({model}, key#{key_index}, attempt {attempt}/2): {type(exc).__name__}")
+                except httpx.HTTPStatusError as exc:
+                    last_status = exc.response.status_code
+                    logger.error(f"Gemini API HTTPStatusError ({model}, key#{key_index}): status_code={last_status}, detail={exc.response.text}")
+                    break  # non-retryable (400/403/404): try next key/model
+                except httpx.RequestError as exc:
+                    last_status = "network"
+                    logger.error(f"Gemini API request error ({model}, key#{key_index}): {type(exc).__name__}")
+                    break
+                except Exception as exc:
+                    logger.error(f"Unexpected error in query_gemini: {type(exc).__name__}")
+                    return "An unexpected error occurred while generating the response. Please try again."
+
+    logger.error(f"All Gemini models/keys failed. Last status: {last_status}")
+    if last_status == "timeout":
+        return "The AI service took too long to respond. Please try again."
+    if last_status == "network":
+        return "A network error occurred while contacting the AI service. Please try again."
+    return f"The AI service returned an error (HTTP {last_status}). Please try again later."
 
 async def query_openai(user_message: str, api_key: str) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -214,13 +225,18 @@ async def query_openai(user_message: str, api_key: str) -> str:
 
     return "The AI service took too long to respond. Please try again."
 
+def get_gemini_keys() -> List[str]:
+    """Reads GEMINI_API_KEYS (comma-separated); falls back to the old GEMINI_API_KEY."""
+    raw = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY", "")
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/health", summary="Health check endpoint")
 async def health():
     provider = os.getenv("LLM_PROVIDER", "auto")
-    has_gemini = bool(os.getenv("GEMINI_API_KEY"))
+    has_gemini = bool(get_gemini_keys())
     has_openai = bool(os.getenv("OPENAI_API_KEY"))
     return {
         "status": "ok",
@@ -244,14 +260,14 @@ async def chat(request: Request, payload: ChatRequest):
     check_rate_limit(client_ip)
 
     # 3. Detect and route to configured LLM
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_keys = get_gemini_keys()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     preferred_provider = os.getenv("LLM_PROVIDER", "gemini").lower()
 
     if preferred_provider == "openai" and openai_key:
         answer = await query_openai(user_msg, openai_key)
-    elif gemini_key:
-        answer = await query_gemini(user_msg, gemini_key)
+    elif gemini_keys:
+        answer = await query_gemini(user_msg, gemini_keys)
     elif openai_key:
         answer = await query_openai(user_msg, openai_key)
     else:
