@@ -18,11 +18,15 @@ if not logger.handlers:
 # Suppress httpx request logging to prevent URL/header leaks
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Explicit timeout configuration (30s total/read, 6s connect)
-TIMEOUT = httpx.Timeout(30.0, connect=6.0)
+# Explicit timeout configuration (10s total/read, 4s connect for fast failover)
+TIMEOUT = httpx.Timeout(10.0, connect=4.0)
 
-# Load environment variables from .env
-load_dotenv()
+# Load environment variables from .env (checks script directory then cwd)
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_path):
+    load_dotenv(dotenv_path=env_path)
+else:
+    load_dotenv()
 
 app = FastAPI(
     title="Mehran AI - Portfolio Assistant API",
@@ -89,11 +93,17 @@ class ChatResponse(BaseModel):
 RETRYABLE = {429, 500, 502, 503, 504}
 
 async def query_gemini(user_message: str, api_keys: List[str]) -> str:
-    """Try each model with each API key. Retries transient errors (503 etc.)."""
-    models = [os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")]
-    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
-    if fallback_model and fallback_model not in models:
-        models.append(fallback_model)
+    """Try each model with each API key. Fast failover on overload (503), quota (429), or timeout."""
+    models = []
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
+    if primary_model:
+        models.append(primary_model)
+    fallback_models_raw = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+    for fm in [m.strip() for m in fallback_models_raw.split(",") if m.strip()]:
+        if fm not in models:
+            models.append(fm)
+    if not models:
+        models = ["gemini-3.1-flash-lite"]
 
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -107,58 +117,60 @@ async def query_gemini(user_message: str, api_keys: List[str]) -> str:
         model_overloaded = False
         for key_index, key in enumerate(api_keys, start=1):
             if model_overloaded:
-                break  # 503s are per-model: more keys won't help, go to the fallback model
+                break  # Overloaded model: skip remaining keys on this model, jump to fallback model
             headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-            for attempt in range(1, 3):
-                try:
-                    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-                        response = await client.post(url, headers=headers, json=payload)
+            try:
+                async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                    response = await client.post(url, headers=headers, json=payload)
 
-                    if response.status_code in RETRYABLE:
-                        last_status = response.status_code
-                        logger.warning(
-                            f"Gemini {model} key#{key_index} -> HTTP {response.status_code} "
-                            f"(attempt {attempt}/2) detail={response.text[:300]}"
-                        )
-                        if response.status_code == 429:
-                            break  # quota hit on this key: move on to the next key
-                        if attempt == 2:
-                            model_overloaded = True  # still failing after a retry
-                            break
-                        await asyncio.sleep(1.5 * attempt)
-                        continue
-
-                    response.raise_for_status()
-                    data = response.json()
-                    candidates = data.get("candidates")
-                    if not candidates or not isinstance(candidates, list):
-                        logger.warning("Gemini response missing or empty 'candidates' field")
-                        return "I apologize, but I could not parse the response from the AI model."
-
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if not parts or not isinstance(parts, list):
-                        logger.warning("Gemini candidate missing 'content.parts' field")
-                        return "I apologize, but I could not parse the response from the AI model."
-
-                    text = parts[0].get("text", "").strip()
-                    if not text:
-                        return "I apologize, but I received an empty response from the AI model."
-                    return text
-
-                except httpx.TimeoutException as exc:
-                    last_status = "timeout"
-                    logger.warning(f"Gemini API timeout ({model}, key#{key_index}, attempt {attempt}/2): {type(exc).__name__}")
-                except httpx.HTTPStatusError as exc:
-                    last_status = exc.response.status_code
-                    logger.error(f"Gemini API HTTPStatusError ({model}, key#{key_index}): status_code={last_status}, detail={exc.response.text}")
-                    break  # non-retryable (400/403/404): try next key/model
-                except httpx.RequestError as exc:
-                    last_status = "network"
-                    logger.error(f"Gemini API request error ({model}, key#{key_index}): {type(exc).__name__}")
+                if response.status_code == 503:
+                    last_status = 503
+                    logger.warning(f"Gemini {model} key#{key_index} -> HTTP 503 Overloaded. Immediately switching to fallback model.")
+                    model_overloaded = True
                     break
-                except Exception as exc:
-                    logger.error(f"Unexpected error in query_gemini: {type(exc).__name__}")
-                    return "An unexpected error occurred while generating the response. Please try again."
+
+                if response.status_code == 429:
+                    last_status = 429
+                    logger.warning(f"Gemini {model} key#{key_index} -> HTTP 429 Quota Exceeded. Trying next key.")
+                    continue  # Quota is per-key: immediately try next key
+
+                if response.status_code in RETRYABLE:
+                    last_status = response.status_code
+                    logger.warning(f"Gemini {model} key#{key_index} -> HTTP {response.status_code}")
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+                candidates = data.get("candidates")
+                if not candidates or not isinstance(candidates, list):
+                    logger.warning("Gemini response missing or empty 'candidates' field")
+                    return "I apologize, but I could not parse the response from the AI model."
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if not parts or not isinstance(parts, list):
+                    logger.warning("Gemini candidate missing 'content.parts' field")
+                    return "I apologize, but I could not parse the response from the AI model."
+
+                text = parts[0].get("text", "").strip()
+                if not text:
+                    return "I apologize, but I received an empty response from the AI model."
+                return text
+
+            except httpx.TimeoutException as exc:
+                last_status = "timeout"
+                logger.warning(f"Gemini API timeout ({model}, key#{key_index}): {type(exc).__name__}. Switching to next key/model.")
+                continue
+            except httpx.HTTPStatusError as exc:
+                last_status = exc.response.status_code
+                logger.error(f"Gemini API HTTPStatusError ({model}, key#{key_index}): status_code={last_status}, detail={exc.response.text}")
+                continue
+            except httpx.RequestError as exc:
+                last_status = "network"
+                logger.error(f"Gemini API request error ({model}, key#{key_index}): {type(exc).__name__}")
+                continue
+            except Exception as exc:
+                logger.error(f"Unexpected error in query_gemini: {type(exc).__name__}")
+                return "An unexpected error occurred while generating the response. Please try again."
 
     logger.error(f"All Gemini models/keys failed. Last status: {last_status}")
     if last_status == "timeout":
