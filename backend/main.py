@@ -424,16 +424,10 @@ async def query_openai(user_message: str, api_key: str) -> Tuple[str, bool, Opti
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
-@app.get("/health", summary="Health check endpoint")
+@app.api_route("/health", methods=["GET", "HEAD"], summary="Health check endpoint")
 async def health():
-    has_gemini = bool(get_gemini_keys())
-    has_openai = bool(os.getenv("OPENAI_API_KEY"))
-    return {
-        "status": "ok",
-        "service": "Mehran AI Backend",
-        "llm_configured": has_gemini or has_openai,
-        "active_provider": "gemini" if has_gemini else ("openai" if has_openai else "none"),
-    }
+    # Minimal on purpose: used by uptime pingers (GET or HEAD) and the site's wake-up check.
+    return {"status": "ok"}
 
 
 @app.post("/chat", response_model=ChatResponse, summary="Chat with Mehran AI")
